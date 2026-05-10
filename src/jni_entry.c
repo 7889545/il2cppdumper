@@ -37,11 +37,14 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
 #include <limits.h>
 
 #include "log.h"
 #include "il2cpp_api.h"
 #include "il2cpp_dump.h"
+#include "elf_sym_find.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -214,7 +217,9 @@ static void read_package_name(char *buf, size_t sz) {
  *   ActivityThread.currentApplication().getFilesDir().getAbsolutePath()
  *
  * The call may block until the Application object is created (up to
- * 30 seconds).
+ * 30 seconds). Any pending JNI exceptions are explicitly cleared
+ * after each call to avoid spurious failures in certain container
+ * environments.
  *
  * @param out_buf Buffer to receive the path.
  * @param out_sz  Size of out_buf.
@@ -261,6 +266,9 @@ static int get_files_dir_jni(char *out_buf, size_t out_sz) {
 
     cls_at = (*env)->FindClass(env, "android/app/ActivityThread");
     if (!cls_at) { CLR_EXC(); goto jni_done; }
+    /* Avoid spurious failures in some
+container configurations. */
+    CLR_EXC();
 
     mid_ca = (*env)->GetStaticMethodID(env, cls_at,
                  "currentApplication", "()Landroid/app/Application;");
@@ -327,60 +335,240 @@ jni_done:
 }
 
 /* -------------------------------------------------------------------------
- * Locate libil2cpp.so in the process memory map
+ * IL2CPP library discovery – three‑tier strategy
  * ------------------------------------------------------------------------- */
+
 /**
- * @brief Parse /proc/self/maps to find the base address and path of
- *        libil2cpp.so.
+ * @brief Quick ELF magic check at a given address.
  *
- * The function searches for a mapping where the file offset is 0
- * (the first loadable segment) and the path ends with "libil2cpp.so".
+ * @param addr potential base address of an ELF image.
+ * @return 1 if the ELF magic (\x7fELF) is present, 0 otherwise.
+ */
+static int is_elf_at(uintptr_t addr) {
+    if (!addr) return 0;
+    const unsigned char *m = (const unsigned char *)addr;
+    return (m[0] == 0x7f && m[1] == 'E' && m[2] == 'L' && m[3] == 'F');
+}
+
+/**
+ * @brief Tier A – scan /proc/self/maps for libil2cpp.so.
  *
- * @param out_path  Buffer for the absolute path (may be empty).
- * @param path_sz   Size of out_path.
- * @param out_base  Receives the mapped base address.
- * @return 1 if found, 0 otherwise.
+ * Looks for readable entries whose path ends with "libil2cpp.so",
+ * selects the one with the lowest start address, and verifies the
+ * ELF signature.
+ *
+ * @param out_path  buffer for the full path of the library.
+ * @param psz       size of out_path.
+ * @param out_base  receives the detected base address.
+ * @return 1 on success, 0 on failure.
+ */
+static int find_il2cpp_by_maps(char *out_path, size_t psz, uintptr_t *out_base) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+
+    char      line[1024];
+    uintptr_t best  = (uintptr_t)-1;
+    char      bpath[PATH_MAX] = {0};
+
+    while (fgets(line, sizeof(line), maps)) {
+        if (!strstr(line, "libil2cpp")) continue;
+
+        unsigned long s = 0, e = 0, off = 0, ino = 0;
+        char perms[8] = {0}, dev[16] = {0}, path[PATH_MAX] = {0};
+
+        int r = sscanf(line, "%lx-%lx %7s %lx %15s %lu %4095s",
+                       &s, &e, perms, &off, dev, &ino, path);
+
+        if (r < 7 || !path[0] || path[0] == '[') continue;
+        if (!strstr(path, "libil2cpp.so"))        continue;
+        if (perms[0] != 'r')                      continue;
+
+        /* Track the lowest start address = ELF header location */
+        if ((uintptr_t)s < best) {
+            best = (uintptr_t)s;
+            strncpy(bpath, path, sizeof(bpath) - 1);
+            bpath[sizeof(bpath) - 1] = '\0';
+        }
+    }
+    fclose(maps);
+
+    if (best == (uintptr_t)-1 || !bpath[0]) return 0;
+    if (!is_elf_at(best)) {
+        LOGW("maps_scan: no ELF magic at 0x%lx (%s)", (unsigned long)best, bpath);
+        return 0;
+    }
+
+    *out_base = best;
+    strncpy(out_path, bpath, psz - 1);
+    out_path[psz - 1] = '\0';
+    LOGI("Tier A found: base=0x%lx path=%s", (unsigned long)best, bpath);
+    return 1;
+}
+
+/* ------------------------------------------------------------------
+ * Tier B: dl_iterate_phdr
+ * ------------------------------------------------------------------ */
+typedef struct { char path[PATH_MAX]; uintptr_t base; int found; } PhdrCtx;
+
+static int phdr_cb(struct dl_phdr_info *info, size_t size, void *arg) {
+    (void)size;
+    PhdrCtx *ctx = (PhdrCtx *)arg;
+    if (!info || !info->dlpi_name) return 0;
+    if (!strstr(info->dlpi_name, "libil2cpp.so")) return 0;
+
+    uintptr_t base = (uintptr_t)info->dlpi_addr;
+
+    /* dlpi_addr is load bias; for p_vaddr==0 SOs it equals the base address.
+     * For non-zero p_vaddr, add the minimum PT_LOAD vaddr to get the header. */
+    if (!is_elf_at(base)) {
+        uintptr_t min_vaddr = (uintptr_t)-1;
+        ElfW(Half) i;
+        for (i = 0; i < info->dlpi_phnum; ++i) {
+            if (info->dlpi_phdr[i].p_type == PT_LOAD) {
+                uintptr_t v = (uintptr_t)info->dlpi_phdr[i].p_vaddr;
+                if (v < min_vaddr) min_vaddr = v;
+            }
+        }
+        if (min_vaddr != (uintptr_t)-1)
+            base = (uintptr_t)info->dlpi_addr + min_vaddr;
+        if (!is_elf_at(base)) return 0;
+    }
+
+    ctx->base = base;
+    strncpy(ctx->path, info->dlpi_name, sizeof(ctx->path) - 1);
+    ctx->path[sizeof(ctx->path) - 1] = '\0';
+    ctx->found = 1;
+    return 1; /* stop iteration */
+}
+
+/**
+ * @brief Locate libil2cpp.so via dl_iterate_phdr.
+ *
+ * Iterates over all loaded shared objects and finds the one whose
+ * name contains "libil2cpp.so".  It computes the runtime base by
+ * adding the smallest PT_LOAD vaddr to the dlpi_addr reported by
+ * the linker (as some containers mangle the reported base).
+ *
+ * @param out_path  buffer for the library path.
+ * @param psz       size of out_path.
+ * @param out_base  receives the computed base address.
+ * @return 1 on success, 0 on failure.
+ */
+static int find_il2cpp_by_phdr(char *out_path, size_t psz, uintptr_t *out_base) {
+    PhdrCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    dl_iterate_phdr(phdr_cb, &ctx);
+    if (!ctx.found) return 0;
+    *out_base = ctx.base;
+    strncpy(out_path, ctx.path, psz - 1);
+    out_path[psz - 1] = '\0';
+    LOGI("Tier B found: base=0x%lx path=%s", (unsigned long)ctx.base, ctx.path);
+    return 1;
+}
+
+/**
+ * @brief Tier C – brute‑force scan of all readable, offset‑0 mappings.
+ *
+ * Opens /proc/self/mem, scans every readable region with file offset 0,
+ * checks for the ELF magic, and then resolves the `il2cpp_domain_get`
+ * symbol to confirm that the region is indeed libil2cpp.so.  This is
+ * the final fallback and can be slow.
+ *
+ * @param out_path  buffer for the library path (or a synthetic name).
+ * @param psz       size of out_path.
+ * @param out_base  receives the detected base address.
+ * @return 1 on success, 0 on failure.
+ */
+static int find_il2cpp_by_brute(char *out_path, size_t psz, uintptr_t *out_base) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+
+    /* Open /proc/self/mem for safe pread()-based magic checks.
+     * pread() returns -1 on unreadable/XOM pages — never faults. */
+    int memfd = open("/proc/self/mem", O_RDONLY);
+
+    char line[1024];
+    int  found = 0;
+
+    while (fgets(line, sizeof(line), maps) && !found) {
+        unsigned long s = 0, e = 0, off = 0, ino = 0;
+        char perms[8] = {0}, dev[16] = {0}, path[PATH_MAX] = {0};
+
+        int r = sscanf(line, "%lx-%lx %7s %lx %15s %lu %4095s",
+                       &s, &e, perms, &off, dev, &ino, path);
+
+        if (r < 6)           continue;
+        if (perms[0] != 'r') continue;
+        if (off != 0)        continue;
+        if (path[0] == '[')  continue;
+        if (strstr(path, "/dev/")  ||
+            strstr(path, "/proc/") ||
+            strstr(path, "/sys/"))  continue;
+
+        uintptr_t base = (uintptr_t)s;
+
+        /* Safe ELF magic check via pread() — no fault on XOM pages */
+        int magic_ok = 0;
+        if (memfd >= 0) {
+            unsigned char magic[4] = {0};
+            ssize_t n = pread(memfd, magic, 4, (off_t)base);
+            magic_ok  = (n == 4 &&
+                         magic[0] == 0x7f && magic[1] == 'E' &&
+                         magic[2] == 'L'  && magic[3] == 'F');
+        } else {
+            /* Fallback: direct read protected by thread crash handler */
+            magic_ok = is_elf_at(base);
+        }
+        if (!magic_ok) continue;
+
+        /* Confirm: probe il2cpp_domain_get via in-memory ELF parse.
+         * Protected by thread-level crash handler if a bad page is hit. */
+        uintptr_t sym = elf_sym_find(base, "il2cpp_domain_get");
+        if (!sym) continue;
+
+        *out_base = base;
+        if (r >= 7 && path[0])
+            strncpy(out_path, path, psz - 1);
+        else
+            snprintf(out_path, psz, "<anon@0x%lx>", (unsigned long)base);
+        out_path[psz - 1] = '\0';
+        LOGI("Tier C found: base=0x%lx path=%s", (unsigned long)base, out_path);
+        found = 1;
+    }
+
+    if (memfd >= 0) close(memfd);
+    fclose(maps);
+    return found;
+}
+
+/**
+ * @brief Dispatch: try all three discovery tiers in order.
+ *
+ *   Tier A – /proc/self/maps with ELF check.
+ *   Tier B – dl_iterate_phdr.
+ *   Tier C – brute‑force scan.
+ *
+ * The first successful tier sets `out_path` and `out_base`.
+ *
+ * @param out_path buffer for the library path.
+ * @param path_sz  size of out_path.
+ * @param out_base receives the base address.
+ * @return 1 if any tier succeeded, 0 otherwise.
  */
 static int find_il2cpp_in_maps(char *out_path, size_t path_sz,
                                 uintptr_t *out_base) {
     *out_base   = 0;
     out_path[0] = '\0';
 
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) return 0;
+    if (find_il2cpp_by_maps(out_path, path_sz, out_base))  return 1;
+    LOGW("Tier A failed; trying dl_iterate_phdr...");
 
-    char line[1024];
-    int  found = 0;
+    if (find_il2cpp_by_phdr(out_path, path_sz, out_base))  return 1;
+    LOGW("Tier B failed; trying brute ELF scan (slow)...");
 
-    while (fgets(line, sizeof(line), maps)) {
-        if (!strstr(line, "libil2cpp.so")) continue;
+    if (find_il2cpp_by_brute(out_path, path_sz, out_base)) return 1;
 
-        unsigned long addr_s = 0, addr_e = 0, offset = 0, inode = 0;
-        char          perms[8]       = {0};
-        char          dev[16]        = {0};
-        char          path[PATH_MAX] = {0};
-
-        int r = sscanf(line, "%lx-%lx %7s %lx %15s %lu %4095s",
-                       &addr_s, &addr_e, perms, &offset, dev, &inode, path);
-        if (r < 7 || !path[0] || path[0] == '[') continue;
-
-        const char *fn = strrchr(path, '/');
-        fn = fn ? fn + 1 : path;
-        if (strcmp(fn, "libil2cpp.so") != 0) continue;
-
-        /* The first loadable segment has file offset 0 */
-        if (offset == 0) {
-            *out_base = (uintptr_t)addr_s;
-            strncpy(out_path, path, path_sz - 1);
-            out_path[path_sz - 1] = '\0';
-            found = 1;
-            LOGI("libil2cpp.so: base=0x%lx path=%s",
-                 (unsigned long)addr_s, out_path);
-            break;
-        }
-    }
-    fclose(maps);
-    return found;
+    return 0;
 }
 
  /* -------------------------------------------------------------------------
